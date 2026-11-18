@@ -23,6 +23,7 @@ if not exist ".git" (
   git init -b main
 )
 git add -A
+git update-index --chmod=+x gradlew
 git commit -m "CUDY: versao inicial (rebrand do Kitsu X)" || echo (nada novo para commit)
 
 where gh >nul 2>nul
