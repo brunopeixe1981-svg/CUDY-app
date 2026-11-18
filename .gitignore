@@ -18,3 +18,5 @@ local.properties
 # Local release builds and keys
 /releases/
 *.keystore
+
+_imagens_cudy/
