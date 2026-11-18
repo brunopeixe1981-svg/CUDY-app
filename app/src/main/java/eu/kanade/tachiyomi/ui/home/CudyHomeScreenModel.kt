@@ -1,0 +1,714 @@
+package eu.kanade.tachiyomi.ui.home
+
+import android.content.Context
+import cafe.adriel.voyager.core.model.ScreenModel
+import cafe.adriel.voyager.core.model.screenModelScope
+import eu.kanade.domain.ui.UiPreferences
+import eu.kanade.presentation.util.formatChapterNumber
+import eu.kanade.tachiyomi.data.download.anime.AnimeDownloadManager
+import eu.kanade.tachiyomi.data.download.manga.MangaDownloadManager
+import eu.kanade.tachiyomi.data.library.anime.AnimeLibraryUpdateJob
+import eu.kanade.tachiyomi.data.library.manga.MangaLibraryUpdateJob
+import eu.kanade.tachiyomi.ui.main.MainActivity
+import eu.kanade.tachiyomi.ui.player.settings.PlayerPreferences
+import eu.kanade.tachiyomi.ui.reader.ReaderActivity
+import eu.kanade.tachiyomi.util.chapter.getNextUnread
+import eu.kanade.tachiyomi.util.episode.getNextUnseen
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import tachiyomi.core.common.i18n.stringResource
+import tachiyomi.core.common.preference.Preference
+import tachiyomi.core.common.preference.PreferenceStore
+import tachiyomi.domain.entries.EntryCover
+import tachiyomi.domain.entries.anime.interactor.GetAnime
+import tachiyomi.domain.entries.anime.interactor.GetLibraryAnime
+import tachiyomi.domain.entries.anime.model.Anime
+import tachiyomi.domain.entries.anime.model.asAnimeCover
+import tachiyomi.domain.entries.manga.interactor.GetLibraryManga
+import tachiyomi.domain.entries.manga.interactor.GetManga
+import tachiyomi.domain.entries.manga.model.Manga
+import tachiyomi.domain.entries.manga.model.asMangaCover
+import tachiyomi.domain.history.anime.interactor.GetAnimeHistory
+import tachiyomi.domain.history.anime.interactor.GetNextEpisodes
+import tachiyomi.domain.history.manga.interactor.GetMangaHistory
+import tachiyomi.domain.items.chapter.interactor.GetChapter
+import tachiyomi.domain.items.chapter.interactor.GetChaptersByMangaId
+import tachiyomi.domain.items.episode.interactor.GetEpisode
+import tachiyomi.domain.items.episode.interactor.GetEpisodesByAnimeId
+import tachiyomi.domain.items.episode.model.Episode
+import tachiyomi.domain.library.anime.LibraryAnime
+import tachiyomi.domain.library.manga.LibraryManga
+import tachiyomi.domain.source.anime.service.AnimeSourceManager
+import tachiyomi.domain.source.manga.service.MangaSourceManager
+import tachiyomi.i18n.MR
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
+import java.util.Calendar
+import java.util.concurrent.ConcurrentHashMap
+
+class CudyHomeScreenModel(
+    private val context: Context,
+    private val getLibraryAnime: GetLibraryAnime = Injekt.get(),
+    private val getLibraryManga: GetLibraryManga = Injekt.get(),
+    private val getAnimeHistory: GetAnimeHistory = Injekt.get(),
+    private val getNextEpisodes: GetNextEpisodes = Injekt.get(),
+    private val getMangaHistory: GetMangaHistory = Injekt.get(),
+    private val getEpisode: GetEpisode = Injekt.get(),
+    private val getChapter: GetChapter = Injekt.get(),
+    private val getEpisodesByAnimeId: GetEpisodesByAnimeId = Injekt.get(),
+    private val getChaptersByMangaId: GetChaptersByMangaId = Injekt.get(),
+    private val animeDownloadManager: AnimeDownloadManager = Injekt.get(),
+    private val mangaDownloadManager: MangaDownloadManager = Injekt.get(),
+    private val uiPreferences: UiPreferences = Injekt.get(),
+    private val preferenceStore: PreferenceStore = Injekt.get(),
+) : ScreenModel {
+
+    private val animeSourceManager by lazy { Injekt.get<AnimeSourceManager>() }
+    private val mangaSourceManager by lazy { Injekt.get<MangaSourceManager>() }
+    private val getAnime: GetAnime = Injekt.get()
+    private val getManga: GetManga = Injekt.get()
+    private val hiddenContinueItemsPreference = preferenceStore.getStringSet(
+        Preference.appStateKey("cudy_hidden_continue_items"),
+        emptySet(),
+    )
+    private val activeContinueActions = ConcurrentHashMap.newKeySet<String>()
+
+    private val preferencesFlow = combine(
+        uiPreferences.showAnime().changes(),
+        uiPreferences.showManga().changes(),
+        uiPreferences.showHeroBanner().changes(),
+    ) { showAnime, showManga, showHeroBanner ->
+        HomePreferenceState(showAnime, showManga, showHeroBanner)
+    }
+
+    private val homeAuxiliaryFlow = combine(
+        preferencesFlow,
+        hiddenContinueItemsPreference.changes(),
+        ::Pair,
+    )
+
+    val state: StateFlow<CudyHomeState> = combine(
+        getLibraryAnime.subscribe(),
+        getLibraryManga.subscribe(),
+        getAnimeHistory.subscribe(""),
+        getMangaHistory.subscribe(""),
+        homeAuxiliaryFlow,
+    ) { libraryAnime, libraryManga, animeHistory, mangaHistory, auxiliaryData ->
+        val (preferences, hiddenContinueItems) = auxiliaryData
+        val (showAnime, showManga, showHeroBanner) = preferences
+        val animeById = libraryAnime.associateBy { it.id }
+        val mangaById = libraryManga.associateBy { it.id }
+
+        // 1. Process continue watching items (mix anime and manga history + library items with unseen count)
+        val continueWatching = mutableListOf<ContinueWatchingItem>()
+        val continueReading = mutableListOf<ContinueWatchingItem>()
+        val addedMediaIds = mutableSetOf<Pair<Long, Boolean>>() // Pair(mediaId, isAnime)
+
+        if (showAnime) {
+            val animeHistoryLatest = selectContinueAnimeHistory(animeHistory) { episodeId ->
+                getEpisode.await(episodeId)?.lastSecondSeen?.let { it > 0L } == true
+            }
+
+            animeHistoryLatest.forEach { hist ->
+                val libAnime = animeById[hist.animeId]
+                val anime = libAnime?.anime ?: getAnime.await(hist.animeId)
+                if (anime == null) return@forEach
+
+                val tempLibAnime = libAnime ?: LibraryAnime(
+                    anime = anime,
+                    category = 0,
+                    totalCount = 1,
+                    seenCount = 1,
+                    bookmarkCount = 0,
+                    fillermarkCount = 0,
+                    latestUpload = 0,
+                    episodeFetchedAt = 0,
+                    lastSeen = hist.seenAt?.time ?: 0L,
+                )
+
+                val currentEpisode = getEpisode.await(hist.episodeId)
+                val targetEpisode = currentEpisode?.takeUnless { it.seen }
+                    ?: getNextEpisodes.await(anime.id, hist.episodeId, onlyUnseen = false)
+                        .firstOrNull { !it.seen }
+
+                targetEpisode?.let { episode ->
+                    val isNewEpisode = currentEpisode?.id != episode.id
+                    continueWatching.add(
+                        episode.toContinueWatchingItem(
+                            anime = tempLibAnime,
+                            lastSeen = if (isNewEpisode) {
+                                maxOf(tempLibAnime.episodeFetchedAt, tempLibAnime.latestUpload).takeIf { it > 0 }
+                                    ?: (hist.seenAt?.time ?: 0L)
+                            } else {
+                                hist.seenAt?.time ?: tempLibAnime.lastSeen
+                            },
+                            isNewEpisode = isNewEpisode,
+                        ),
+                    )
+                    addedMediaIds.add(Pair(hist.animeId, true))
+                }
+            }
+        }
+
+        if (showManga) {
+            val mangaHistoryLatest = mangaHistory.groupBy { it.mangaId }
+                .map { (_, list) -> list.first() }
+                .take(15)
+
+            mangaHistoryLatest.forEach { hist ->
+                val libManga = mangaById[hist.mangaId]
+                val manga = libManga?.manga ?: getManga.await(hist.mangaId)
+                if (manga == null) return@forEach
+
+                val hasUpdates = libManga?.let { it.unreadCount > 0 } ?: false
+                val unreadVal = libManga?.unreadCount?.toInt() ?: 0
+
+                // Calculate manga chapter progress from lastPageRead
+                val chapter = getChapter.await(hist.chapterId)
+                val isChapterPending = chapter != null && !chapter.read
+                val hasNewChapters = hasUpdates || unreadVal > 0
+                val targetChapter = chapter?.takeUnless { it.read }
+                    ?: if (hasNewChapters || libManga == null) {
+                        getChaptersByMangaId.await(manga.id, applyScanlatorFilter = true)
+                            .getNextUnread(manga, mangaDownloadManager)
+                    } else {
+                        null
+                    }
+
+                if (targetChapter != null && (isChapterPending || hasNewChapters || libManga == null)) {
+                    val isNewChapter = chapter?.id != targetChapter.id
+                    val chapterProgress = when {
+                        chapter == null -> 0f
+                        chapter.read || isNewChapter -> 0f
+                        chapter.lastPageRead > 0L -> {
+                            (chapter.lastPageRead.toFloat() / (chapter.lastPageRead + 3).toFloat()).coerceIn(0.1f, 0.9f)
+                        }
+                        else -> 0f
+                    }
+                    val chapterProgressText = if (isNewChapter) {
+                        context.stringResource(MR.strings.cudy_home_new_badge)
+                    } else {
+                        if (targetChapter.chapterNumber >= 0) {
+                            context.stringResource(
+                                MR.strings.cudy_continue_chapter,
+                                formatChapterNumber(targetChapter.chapterNumber),
+                            )
+                        } else {
+                            targetChapter.name
+                        }
+                    }
+                    val mediaItem = manga.toMediaItem().copy(
+                        hasUpdates = hasUpdates || isNewChapter,
+                        unseenCount = unreadVal,
+                        isStarted = true,
+                    )
+
+                    continueReading.add(
+                        ContinueWatchingItem(
+                            id = hist.mangaId,
+                            title = manga.title,
+                            thumbnailUrl = manga.thumbnailUrl,
+                            isAnime = false,
+                            lastSeen = hist.readAt?.time ?: 0L,
+                            progressText = chapterProgressText,
+                            episodeProgress = chapterProgress,
+                            targetItemId = targetChapter.id,
+                            mediaItem = mediaItem,
+                            hasUpdates = hasUpdates || isNewChapter,
+                            unseenCount = unreadVal,
+                        ),
+                    )
+                    addedMediaIds.add(Pair(hist.mangaId, false))
+                }
+            }
+        }
+
+        // Library updates without playback history belong in the new releases section.
+        if (showManga) {
+            libraryManga.forEach { libItem ->
+                if (libItem.hasStarted &&
+                    libItem.unreadCount > 0 &&
+                    !addedMediaIds.contains(Pair(libItem.id, false))
+                ) {
+                    val nextChapter = getChaptersByMangaId.await(libItem.id, applyScanlatorFilter = true)
+                        .getNextUnread(libItem.manga, mangaDownloadManager)
+                        ?: return@forEach
+                    val mediaItem = libItem.manga.toMediaItem().copy(
+                        hasUpdates = true,
+                        unseenCount = libItem.unreadCount.toInt(),
+                    )
+                    val lastSeenTime = if (libItem.chapterFetchedAt >
+                        0L
+                    ) {
+                        libItem.chapterFetchedAt
+                    } else {
+                        libItem.latestUpload
+                    }
+                    continueReading.add(
+                        ContinueWatchingItem(
+                            id = libItem.id,
+                            title = libItem.manga.title,
+                            thumbnailUrl = libItem.manga.thumbnailUrl,
+                            isAnime = false,
+                            lastSeen = lastSeenTime,
+                            progressText = context.stringResource(MR.strings.cudy_home_new_badge),
+                            mediaItem = mediaItem,
+                            hasUpdates = true,
+                            unseenCount = libItem.unreadCount.toInt(),
+                            targetItemId = nextChapter.id,
+                        ),
+                    )
+                    addedMediaIds.add(Pair(libItem.id, false))
+                }
+            }
+        }
+
+        val sortedContinueWatching = continueWatching
+            .filter { it.isAnime }
+            .filterNot { it.hiddenContinueKey() in hiddenContinueItems }
+            .distinctBy { it.id }
+            .sortedByDescending { it.lastSeen }
+            .take(15)
+        val sortedContinueReading = continueReading
+            .filter { !it.isAnime }
+            .filterNot { it.hiddenContinueKey() in hiddenContinueItems }
+            .distinctBy { it.id }
+            .sortedByDescending { it.lastSeen }
+            .take(15)
+        val newReleases = mutableListOf<ContinueWatchingItem>()
+
+        if (showAnime) {
+            libraryAnime.distinctBy { it.id }.forEach { libItem ->
+                if (libItem.unseenCount > 0) {
+                    val nextEpisode = getEpisodesByAnimeId.await(libItem.id)
+                        .getNextUnseen(libItem.anime, animeDownloadManager)
+                    nextEpisode?.let { episode ->
+                        newReleases.add(
+                            episode.toContinueWatchingItem(
+                                anime = libItem,
+                                lastSeen = maxOf(libItem.episodeFetchedAt, libItem.latestUpload),
+                                isNewEpisode = true,
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+
+        if (showManga) {
+            libraryManga.distinctBy { it.id }.forEach { libItem ->
+                if (libItem.unreadCount > 0) {
+                    val lastUpdate = if (libItem.chapterFetchedAt >
+                        0L
+                    ) {
+                        libItem.chapterFetchedAt
+                    } else {
+                        libItem.latestUpload
+                    }
+                    newReleases.add(libItem.toNewReleaseItem(lastUpdate))
+                }
+            }
+        }
+
+        val sortedNewReleases = newReleases
+            .sortedByDescending { it.lastSeen }
+            .distinctBy { "${it.id}_${it.isAnime}" }
+            .take(20)
+        val newReleaseGroups = groupNewReleases(sortedNewReleases)
+
+        val libraryItems = buildList {
+            if (showAnime) {
+                libraryAnime.distinctBy { it.id }.forEach { entry ->
+                    add(
+                        HomeLibraryCandidate(
+                            item = entry.anime.toMediaItem().copy(
+                                hasUpdates = entry.unseenCount > 0,
+                                unseenCount = entry.unseenCount.toInt(),
+                                isStarted = entry.hasStarted,
+                            ),
+                            lastViewedAt = entry.lastSeen,
+                            latestContentAt = maxOf(entry.latestUpload, entry.episodeFetchedAt),
+                            addedAt = entry.anime.dateAdded,
+                        ),
+                    )
+                }
+            }
+            if (showManga) {
+                libraryManga.distinctBy { it.id }.forEach { entry ->
+                    add(
+                        HomeLibraryCandidate(
+                            item = entry.manga.toMediaItem().copy(
+                                hasUpdates = entry.unreadCount > 0,
+                                unseenCount = entry.unreadCount.toInt(),
+                                isStarted = entry.hasStarted,
+                            ),
+                            lastViewedAt = entry.lastRead,
+                            latestContentAt = maxOf(entry.latestUpload, entry.chapterFetchedAt),
+                            addedAt = entry.manga.dateAdded,
+                        ),
+                    )
+                }
+            }
+        }
+        val heroItems = libraryItems
+            .sortedWith(
+                compareBy<HomeLibraryCandidate> { it.priority }
+                    .thenByDescending { it.relevantAt }
+                    .thenByDescending { it.addedAt },
+            )
+            .take(5)
+            .map { it.item }
+        val recentlyAdded = libraryItems
+            .sortedByDescending { it.addedAt }
+            .take(12)
+            .map { it.item }
+
+        CudyHomeState(
+            heroBannerItems = if (showHeroBanner) heroItems else emptyList(),
+            continueWatching = sortedContinueWatching,
+            continueReading = sortedContinueReading,
+            newReleaseGroups = newReleaseGroups,
+            recentlyAdded = recentlyAdded,
+            isLibraryEmpty = libraryAnime.isEmpty() && libraryManga.isEmpty(),
+            isLoading = false,
+        )
+    }.flowOn(Dispatchers.IO).stateIn(
+        scope = screenModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = CudyHomeState(isLoading = true),
+    )
+
+    private fun Anime.toMediaItem() = CudyMediaItem(
+        id = id,
+        title = title,
+        thumbnailUrl = thumbnailUrl,
+        heroArtworkUrl = backgroundUrl,
+        description = description ?: "",
+        genres = genre ?: emptyList(),
+        isAnime = true,
+        sourceName = animeSourceManager.get(source)?.name.orEmpty(),
+        realModel = this,
+    )
+
+    private fun Episode.toContinueWatchingItem(
+        anime: LibraryAnime,
+        lastSeen: Long,
+        isNewEpisode: Boolean,
+    ): ContinueWatchingItem {
+        val progress = if (!isNewEpisode && totalSeconds > 0) {
+            (lastSecondSeen.toFloat() / totalSeconds.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+        val episodeLabel = if (isRecognizedNumber) {
+            context.stringResource(MR.strings.cudy_home_episode_number, episodeNumber.toInt())
+        } else {
+            name
+        }
+        val progressLabel = if (!isNewEpisode && totalSeconds > 0 && lastSecondSeen > 0) {
+            val remainingSecs = (totalSeconds - lastSecondSeen) / 1000
+            if (remainingSecs > 60) {
+                "$episodeLabel · ${context.stringResource(
+                    MR.strings.cudy_home_minutes_remaining,
+                    remainingSecs / 60,
+                )}"
+            } else {
+                episodeLabel
+            }
+        } else {
+            episodeLabel
+        }
+        val mediaItem = anime.anime.toMediaItem().copy(
+            hasUpdates = isNewEpisode,
+            unseenCount = 0,
+            isStarted = anime.hasStarted,
+        )
+
+        return ContinueWatchingItem(
+            id = anime.id,
+            title = anime.anime.title,
+            thumbnailUrl = anime.anime.thumbnailUrl,
+            isAnime = true,
+            lastSeen = lastSeen,
+            progressText = progressLabel,
+            episodeProgress = progress,
+            targetItemId = id,
+            mediaItem = mediaItem,
+            hasUpdates = isNewEpisode,
+            unseenCount = 0,
+        )
+    }
+
+    private fun Manga.toMediaItem() = CudyMediaItem(
+        id = id,
+        title = title,
+        thumbnailUrl = thumbnailUrl,
+        description = description ?: "",
+        genres = genre ?: emptyList(),
+        isAnime = false,
+        sourceName = mangaSourceManager.get(source)?.name.orEmpty(),
+        realModel = this,
+    )
+
+    private fun LibraryManga.toNewReleaseItem(lastUpdate: Long): ContinueWatchingItem {
+        val mediaItem = manga.toMediaItem().copy(
+            hasUpdates = true,
+            unseenCount = unreadCount.toInt(),
+            isStarted = hasStarted,
+        )
+        return ContinueWatchingItem(
+            id = id,
+            title = manga.title,
+            thumbnailUrl = manga.thumbnailUrl,
+            isAnime = false,
+            lastSeen = lastUpdate,
+            progressText = context.stringResource(MR.strings.cudy_home_new_chapters_count, unreadCount.toInt()),
+            mediaItem = mediaItem,
+            hasUpdates = true,
+            unseenCount = unreadCount.toInt(),
+        )
+    }
+
+    private fun groupNewReleases(items: List<ContinueWatchingItem>): List<CudyNewReleaseGroup> {
+        val startOfToday = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        val startOfYesterday = (startOfToday.clone() as Calendar).apply {
+            add(Calendar.DAY_OF_YEAR, -1)
+        }.timeInMillis
+        val startOfWeek = (startOfToday.clone() as Calendar).apply {
+            add(Calendar.DAY_OF_YEAR, -6)
+        }.timeInMillis
+        val today = startOfToday.timeInMillis
+
+        return listOf(
+            CudyNewReleaseGroup(
+                title = context.stringResource(MR.strings.cudy_home_today),
+                items = items.filter { it.lastSeen >= today },
+            ),
+            CudyNewReleaseGroup(
+                title = context.stringResource(MR.strings.cudy_home_yesterday),
+                items = items.filter { it.lastSeen in startOfYesterday until today },
+            ),
+            CudyNewReleaseGroup(
+                title = context.stringResource(MR.strings.cudy_home_this_week),
+                items = items.filter { it.lastSeen in startOfWeek until startOfYesterday },
+            ),
+        ).filter { it.items.isNotEmpty() }
+    }
+
+    fun hideContinueItem(continueItem: ContinueWatchingItem) {
+        hiddenContinueItemsPreference.set(
+            hiddenContinueItemsPreference.get() + continueItem.hiddenContinueKey(),
+        )
+    }
+
+    fun continueWatchingOrReading(
+        context: Context,
+        continueItem: ContinueWatchingItem,
+        navigator: cafe.adriel.voyager.navigator.Navigator,
+    ) {
+        val continueKey = "${continueItem.isAnime}_${continueItem.id}"
+        if (!activeContinueActions.add(continueKey)) return
+
+        screenModelScope.launch {
+            try {
+                if (continueItem.isAnime) {
+                    val animeId = continueItem.id
+                    var targetEpisodeId: Long? = continueItem.targetItemId
+
+                    val lastHist = if (targetEpisodeId == null) {
+                        getAnimeHistory.await(animeId).firstOrNull()
+                    } else {
+                        null
+                    }
+                    if (lastHist != null) {
+                        val episode = getEpisode.await(lastHist.episodeId)
+                        if (episode != null && !episode.seen) {
+                            targetEpisodeId = episode.id
+                        }
+                    }
+
+                    if (targetEpisodeId == null) {
+                        val getAnime = Injekt.get<GetAnime>()
+                        val getEpisodesByAnimeId = Injekt.get<GetEpisodesByAnimeId>()
+                        val downloadManager = Injekt.get<AnimeDownloadManager>()
+                        val anime = getAnime.await(animeId)
+                        if (anime != null) {
+                            val nextUnseen = getEpisodesByAnimeId.await(anime.id).getNextUnseen(anime, downloadManager)
+                            if (nextUnseen != null) {
+                                targetEpisodeId = nextUnseen.id
+                            }
+                        }
+                    }
+
+                    if (targetEpisodeId != null) {
+                        withContext(Dispatchers.Main) {
+                            val playerPreferences = Injekt.get<PlayerPreferences>()
+                            val extPlayer = playerPreferences.alwaysUseExternalPlayer().get()
+                            MainActivity.startPlayerActivity(context, animeId, targetEpisodeId, extPlayer)
+                        }
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            navigator.push(eu.kanade.tachiyomi.ui.entries.anime.AnimeScreen(animeId))
+                        }
+                    }
+                } else {
+                    val mangaId = continueItem.id
+                    var targetChapterId: Long? = continueItem.targetItemId
+
+                    val lastHist = if (targetChapterId == null) {
+                        getMangaHistory.await(mangaId).firstOrNull()
+                    } else {
+                        null
+                    }
+                    if (lastHist != null) {
+                        val chapter = getChapter.await(lastHist.chapterId)
+                        if (chapter != null && !chapter.read) {
+                            targetChapterId = chapter.id
+                        }
+                    }
+
+                    if (targetChapterId == null) {
+                        val getManga = Injekt.get<GetManga>()
+                        val getChaptersByMangaId = Injekt.get<GetChaptersByMangaId>()
+                        val downloadManager = Injekt.get<MangaDownloadManager>()
+                        val manga = getManga.await(mangaId)
+                        if (manga != null) {
+                            val nextUnread = getChaptersByMangaId.await(manga.id, applyScanlatorFilter = true)
+                                .getNextUnread(manga, downloadManager)
+                            if (nextUnread != null) {
+                                targetChapterId = nextUnread.id
+                            }
+                        }
+                    }
+
+                    if (targetChapterId == null && lastHist != null) {
+                        targetChapterId = lastHist.chapterId
+                    }
+
+                    if (targetChapterId != null) {
+                        withContext(Dispatchers.Main) {
+                            context.startActivity(
+                                ReaderActivity.newIntent(
+                                    context,
+                                    mangaId,
+                                    targetChapterId,
+                                ),
+                            )
+                        }
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            navigator.push(eu.kanade.tachiyomi.ui.entries.manga.MangaScreen(mangaId))
+                        }
+                    }
+                }
+            } finally {
+                activeContinueActions.remove(continueKey)
+            }
+        }
+    }
+
+    fun refresh() {
+        screenModelScope.launch {
+            withContext(Dispatchers.Main) {
+                AnimeLibraryUpdateJob.startNow(context)
+                MangaLibraryUpdateJob.startNow(context)
+            }
+        }
+    }
+}
+
+data class CudyHomeState(
+    val heroBannerItems: List<CudyMediaItem> = emptyList(),
+    val continueWatching: List<ContinueWatchingItem> = emptyList(),
+    val continueReading: List<ContinueWatchingItem> = emptyList(),
+    val newReleaseGroups: List<CudyNewReleaseGroup> = emptyList(),
+    val recentlyAdded: List<CudyMediaItem> = emptyList(),
+    val isLibraryEmpty: Boolean = true,
+    val isLoading: Boolean = true,
+)
+
+data class CudyNewReleaseGroup(
+    val title: String,
+    val items: List<ContinueWatchingItem>,
+)
+
+data class ContinueWatchingItem(
+    val id: Long,
+    val title: String,
+    val thumbnailUrl: String?,
+    val heroArtworkUrl: String? = null,
+    val isAnime: Boolean,
+    val lastSeen: Long,
+    val progressText: String,
+    val mediaItem: CudyMediaItem,
+    val hasUpdates: Boolean = false,
+    val unseenCount: Int = 0,
+    /** Real progress 0.0..1.0. 0f = unknown/not started, 1f = completed. */
+    val episodeProgress: Float = 0f,
+    val targetItemId: Long? = null,
+)
+
+private fun ContinueWatchingItem.hiddenContinueKey(): String {
+    val type = if (isAnime) "anime" else "manga"
+    return "$type:$id:${targetItemId ?: 0L}"
+}
+
+data class CudyMediaItem(
+    val id: Long,
+    val title: String,
+    val thumbnailUrl: String?,
+    val heroArtworkUrl: String? = null,
+    val sourceName: String = "",
+    val description: String,
+    val genres: List<String>,
+    val rating: String = "8.8",
+    val isAnime: Boolean,
+    val realModel: Any? = null,
+    val hasUpdates: Boolean = false,
+    val unseenCount: Int = 0,
+    val isRecommendation: Boolean = false,
+    val isStarted: Boolean = false,
+) {
+    val coverData: EntryCover?
+        get() = when (val entry = realModel) {
+            is Anime -> entry.asAnimeCover()
+            is Manga -> entry.asMangaCover()
+            else -> null
+        }
+}
+
+private data class HomePreferenceState(
+    val showAnime: Boolean,
+    val showManga: Boolean,
+    val showHeroBanner: Boolean,
+)
+
+private data class HomeLibraryCandidate(
+    val item: CudyMediaItem,
+    val lastViewedAt: Long,
+    val latestContentAt: Long,
+    val addedAt: Long,
+) {
+    val priority: Int
+        get() = when {
+            item.isStarted && item.hasUpdates -> 0
+            lastViewedAt > 0 -> 1
+            item.isStarted -> 2
+            item.hasUpdates -> 3
+            else -> 4
+        }
+
+    val relevantAt: Long
+        get() = if (item.hasUpdates) maxOf(lastViewedAt, latestContentAt) else lastViewedAt
+}

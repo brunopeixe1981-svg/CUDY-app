@@ -1,0 +1,325 @@
+package eu.kanade.presentation.updates.anime
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.sizeIn
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Label
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.Circle
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import eu.kanade.presentation.components.relativeDateText
+import eu.kanade.presentation.entries.anime.components.EpisodeDownloadAction
+import eu.kanade.presentation.entries.anime.components.EpisodeDownloadIndicator
+import eu.kanade.presentation.entries.components.DotSeparatorText
+import eu.kanade.presentation.entries.components.ItemCover
+import eu.kanade.presentation.updates.RecentGroupCard
+import eu.kanade.presentation.util.animateItemFastScroll
+import eu.kanade.presentation.util.relativeTimeSpanString
+import eu.kanade.tachiyomi.data.download.anime.model.AnimeDownload
+import eu.kanade.tachiyomi.ui.updates.anime.AnimeUpdatesItem
+import tachiyomi.domain.updates.anime.model.AnimeUpdatesWithRelations
+import tachiyomi.i18n.MR
+import tachiyomi.i18n.aniyomi.AYMR
+import tachiyomi.presentation.core.components.material.DISABLED_ALPHA
+import tachiyomi.presentation.core.components.material.padding
+import tachiyomi.presentation.core.i18n.stringResource
+import tachiyomi.presentation.core.util.selectedBackground
+import java.time.LocalDate
+import java.util.concurrent.TimeUnit
+
+internal fun LazyListScope.animeUpdatesLastUpdatedItem(
+    lastUpdated: Long,
+) {
+    item(key = "animeUpdates-lastUpdated") {
+        Box(
+            modifier = Modifier
+                .animateItem(fadeInSpec = null, fadeOutSpec = null)
+                .padding(
+                    horizontal = MaterialTheme.padding.medium,
+                    vertical = MaterialTheme.padding.small,
+                ),
+        ) {
+            Text(
+                text = stringResource(MR.strings.updates_last_update_info, relativeTimeSpanString(lastUpdated)),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+internal fun LazyListScope.animeUpdatesUiItems(
+    uiModels: List<AnimeUpdatesUiModel>,
+    expandedGroups: Set<Long>? = null,
+    onToggleGroup: (Long) -> Unit = {},
+    selectionMode: Boolean,
+    onUpdateSelected: (AnimeUpdatesItem, Boolean, Boolean, Boolean) -> Unit,
+    onClickCover: (AnimeUpdatesItem) -> Unit,
+    onClickUpdate: (AnimeUpdatesItem, altPlayer: Boolean) -> Unit,
+    onDownloadEpisode: (List<AnimeUpdatesItem>, EpisodeDownloadAction) -> Unit,
+) {
+    val groupItems = uiModels.filterIsInstance<AnimeUpdatesUiModel.Item>().associateBy { it.item.update.animeId }
+    val visibleModels = uiModels.filter {
+        it !is AnimeUpdatesUiModel.Item ||
+            expandedGroups == null ||
+            selectionMode ||
+            it.item.update.animeId in expandedGroups
+    }
+    items(
+        items = visibleModels,
+        contentType = {
+            when (it) {
+                is AnimeUpdatesUiModel.Group -> "group"
+                is AnimeUpdatesUiModel.Header -> "header"
+                is AnimeUpdatesUiModel.Item -> "item"
+            }
+        },
+        key = {
+            when (it) {
+                is AnimeUpdatesUiModel.Group -> "animeUpdatesGroup-${it.id}"
+                is AnimeUpdatesUiModel.Header -> "animeUpdatesHeader-${it.hashCode()}"
+                is AnimeUpdatesUiModel.Item -> "animeUpdates-${it.item.update.animeId}-${it.item.update.episodeId}"
+            }
+        },
+    ) { item ->
+        when (item) {
+            is AnimeUpdatesUiModel.Group -> {
+                val representative = groupItems.getValue(item.id).item
+                RecentGroupCard(
+                    title = item.title,
+                    cover = representative.update.coverData,
+                    count = item.count,
+                    expanded = selectionMode || item.id in expandedGroups.orEmpty(),
+                    enabled = !selectionMode,
+                    onToggle = { onToggleGroup(item.id) },
+                    onCoverClick = { onClickCover(representative) },
+                )
+            }
+            is AnimeUpdatesUiModel.Header -> {
+                Text(
+                    modifier = Modifier.animateItemFastScroll().padding(horizontal = 20.dp, vertical = 16.dp),
+                    text = when (item.date) {
+                        LocalDate.now() -> stringResource(MR.strings.cudy_home_today)
+                        LocalDate.now().minusDays(1) -> stringResource(MR.strings.cudy_home_yesterday)
+                        else -> relativeDateText(item.date)
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            is AnimeUpdatesUiModel.Item -> {
+                val updatesItem = item.item
+                AnimeUpdatesUiItem(
+                    modifier = Modifier.animateItemFastScroll(),
+                    update = updatesItem.update,
+                    compact = expandedGroups != null,
+                    selected = updatesItem.selected,
+                    watchProgress = updatesItem.update.lastSecondSeen
+                        .takeIf { !updatesItem.update.seen && it > 0L }
+                        ?.let {
+                            stringResource(
+                                AYMR.strings.episode_progress,
+                                formatProgress(it),
+                                formatProgress(updatesItem.update.totalSeconds),
+                            )
+                        },
+                    onLongClick = {
+                        onUpdateSelected(updatesItem, !updatesItem.selected, true, true)
+                    },
+                    onClick = {
+                        when {
+                            selectionMode -> onUpdateSelected(
+                                updatesItem,
+                                !updatesItem.selected,
+                                true,
+                                false,
+                            )
+                            else -> onClickUpdate(updatesItem, false)
+                        }
+                    },
+                    onClickCover = { onClickCover(updatesItem) }.takeIf { !selectionMode },
+                    onDownloadEpisode = { action: EpisodeDownloadAction ->
+                        onDownloadEpisode(listOf(updatesItem), action)
+                    }.takeIf { !selectionMode },
+                    downloadStateProvider = updatesItem.downloadStateProvider,
+                    downloadProgressProvider = updatesItem.downloadProgressProvider,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AnimeUpdatesUiItem(
+    update: AnimeUpdatesWithRelations,
+    compact: Boolean = false,
+    selected: Boolean,
+    watchProgress: String?,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    onClickCover: (() -> Unit)?,
+    onDownloadEpisode: ((EpisodeDownloadAction) -> Unit)?,
+    // Download Indicator
+    downloadStateProvider: () -> AnimeDownload.State,
+    downloadProgressProvider: () -> Int,
+    modifier: Modifier = Modifier,
+) {
+    val haptic = LocalHapticFeedback.current
+    val textAlpha = if (update.seen) DISABLED_ALPHA else 1f
+
+    Row(
+        modifier = modifier
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .selectedBackground(selected)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = {
+                    onLongClick()
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                },
+            )
+            .height(if (compact) 64.dp else 88.dp)
+            .padding(horizontal = MaterialTheme.padding.medium),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (!compact) {
+            ItemCover.Book(
+                modifier = Modifier
+                    .padding(vertical = 10.dp)
+                    .fillMaxHeight(),
+                data = update.coverData,
+                shape = RoundedCornerShape(10.dp),
+                onClick = onClickCover,
+            )
+        }
+        Column(
+            modifier = Modifier
+                .padding(horizontal = MaterialTheme.padding.medium)
+                .weight(1f),
+        ) {
+            if (!compact) {
+                Text(
+                    text = update.animeTitle,
+                    maxLines = 1,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = LocalContentColor.current.copy(alpha = textAlpha),
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                var textHeight by remember { mutableIntStateOf(0) }
+                if (!update.seen) {
+                    Icon(
+                        imageVector = Icons.Filled.Circle,
+                        contentDescription = stringResource(MR.strings.unread),
+                        modifier = Modifier
+                            .height(8.dp)
+                            .padding(end = 4.dp),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                if (update.bookmark) {
+                    Icon(
+                        imageVector = Icons.Filled.Bookmark,
+                        contentDescription = stringResource(MR.strings.action_filter_bookmarked),
+                        modifier = Modifier
+                            .sizeIn(
+                                maxHeight = with(LocalDensity.current) { textHeight.toDp() - 2.dp },
+                            ),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(modifier = Modifier.width(2.dp))
+                }
+                if (update.fillermark) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.Label,
+                        contentDescription = stringResource(AYMR.strings.action_filter_fillermarked),
+                        modifier = Modifier
+                            .sizeIn(
+                                maxHeight = with(LocalDensity.current) { textHeight.toDp() - 2.dp },
+                            ),
+                        tint = MaterialTheme.colorScheme.tertiary,
+                    )
+                    Spacer(modifier = Modifier.width(2.dp))
+                }
+                Text(
+                    text = update.episodeName,
+                    maxLines = if (compact) 2 else 1,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = LocalContentColor.current.copy(alpha = textAlpha),
+                    overflow = TextOverflow.Ellipsis,
+                    onTextLayout = { textHeight = it.size.height },
+                    modifier = Modifier
+                        .weight(weight = 1f, fill = false),
+                )
+                if (watchProgress != null) {
+                    DotSeparatorText()
+                    Text(
+                        text = watchProgress,
+                        maxLines = 1,
+                        color = LocalContentColor.current.copy(alpha = DISABLED_ALPHA),
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+
+        EpisodeDownloadIndicator(
+            enabled = onDownloadEpisode != null,
+            modifier = Modifier.padding(start = 4.dp),
+            downloadStateProvider = downloadStateProvider,
+            downloadProgressProvider = downloadProgressProvider,
+            onClick = { onDownloadEpisode?.invoke(it) },
+        )
+    }
+}
+
+private fun formatProgress(milliseconds: Long): String {
+    return if (milliseconds > 3600000L) {
+        String.format(
+            "%d:%02d:%02d",
+            TimeUnit.MILLISECONDS.toHours(milliseconds),
+            TimeUnit.MILLISECONDS.toMinutes(milliseconds) -
+                TimeUnit.HOURS.toMinutes(TimeUnit.MILLISECONDS.toHours(milliseconds)),
+            TimeUnit.MILLISECONDS.toSeconds(milliseconds) -
+                TimeUnit.MINUTES.toSeconds(TimeUnit.MILLISECONDS.toMinutes(milliseconds)),
+        )
+    } else {
+        String.format(
+            "%d:%02d",
+            TimeUnit.MILLISECONDS.toMinutes(milliseconds),
+            TimeUnit.MILLISECONDS.toSeconds(milliseconds) -
+                TimeUnit.MINUTES.toSeconds(TimeUnit.MILLISECONDS.toMinutes(milliseconds)),
+        )
+    }
+}
